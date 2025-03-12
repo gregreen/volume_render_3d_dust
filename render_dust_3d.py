@@ -1,7 +1,6 @@
 import numpy as np
 
 import tensorflow as tf
-import tensorflow_graphics as tfg
 from tensorflow_graphics.math.interpolation.trilinear import interpolate as trilinear_interpolate
 from tensorflow_graphics.geometry.transformation import rotation_matrix_3d, quaternion
 
@@ -12,7 +11,6 @@ plt.style.use('dark_background')
 
 from astropy.coordinates import SkyCoord
 import astropy.units as u
-import astropy_healpix
 
 from scipy.interpolate import CubicSpline
 

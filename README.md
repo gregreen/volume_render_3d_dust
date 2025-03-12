@@ -24,3 +24,18 @@ a video. Two scripts are provided to do this:
   2. `gen_forward_video.sh`: Generates a video by running through the frames
      in the forward direction. This is the most straightforward type of
      video.
+
+Dependencies
+------------
+
+This code runs on the GPU, if available, using Tensorflow 2.x. It requires:
+
+  * `tensorflow`
+  * `tensorflow_graphics`
+  * `dustmaps`
+  * `numpy`
+  * `scipy`
+  * `astropy`
+  * `matplotlib`
+  * `Pillow`
+  * `tqdm`
