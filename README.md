@@ -7,8 +7,8 @@ The script `render_dust_3d.py` contains various functions that can be used to
 volume-render 3D dust maps. The key elements that go into the rendering are:
 
   1. A 3D dust map, reprojected to a Cartesian sky projection.
-  2. A set of camera positions and orientations.
-  3. A set of camera properties (field of view, resolution, etc.).
+  2. A set of camera positions and orientations (one per frame).
+  3. Camera properties (field of view, resolution, etc.).
 
 The `main()` function of `render_dust_3d.py` contains an example of how to
 generate the frames of a volume-rendered video. The helper functions can be
