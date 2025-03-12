@@ -10,9 +10,9 @@ volume-render 3D dust maps. The key elements that go into the rendering are:
   2. A set of camera positions and orientations.
   3. A set of camera properties (field of view, resolution, etc.).
 
-The `main()` function contains an example of how to generate the frames of a
-volume-rendered video. The helper functions can be used to generate different
-camera paths or to load different 3D dust maps.
+The `main()` function of `render_dust_3d.py` contains an example of how to
+generate the frames of a volume-rendered video. The helper functions can be
+used to generate different camera paths or to load different 3D dust maps.
 
 After the frames have been generated, `ffmpeg` can be used to turn them into
 a video. Two scripts are provided to do this:
