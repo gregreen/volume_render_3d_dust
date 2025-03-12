@@ -1,0 +1,4 @@
+# Don't add anything from this directory
+*
+# ... except this file
+!.gitignore
