@@ -19,7 +19,8 @@ from tqdm.auto import tqdm
 
 def save_dustmap_cube(fname, map_values, ln_dist_edges):
     """
-    Saves a 3D dust map in a Cartesian sky projection to an NPZ file.
+    Saves a 3D dust map in a Cartesian sky projection to an NPZ file. This map
+    is faster to load than the original files used by the dustmaps package.
 
     Args:
         fname (str): Filename (with path) where the dust map will be saved.
@@ -38,7 +39,9 @@ def save_dustmap_cube(fname, map_values, ln_dist_edges):
 
 def load_dustmap_cube(fname):
     """
-    Loads a 3D dust map from an NPZ file that has been converted to a Cartesian sky projection.
+    Loads a 3D dust map from an NPZ file that has been converted to a Cartesian
+    sky projection. This is faster than loading the maps using the dustmaps
+    package.
 
     Args:
         fname (str): Filename (with path) of the NPZ file containing the dust map.
@@ -769,7 +772,7 @@ def flythrough_camera(n_frames):
     return camera_path, camera_orientations
 
 
-def solar_orbit_camera(n_frames, radius, lon0, lat0, dist0):
+def solar_orbit_camera(n_frames, radius, lon0, lat0, dist0, x0=[0,0,0]):
     """
     Generates a solar orbit camera path and corresponding orientations.
 
@@ -779,6 +782,7 @@ def solar_orbit_camera(n_frames, radius, lon0, lat0, dist0):
         lon0 (float): Longitude (in degrees) of the target location to stare at.
         lat0 (float): Latitude (in degrees) of the target location to stare at.
         dist0 (float): Distance scaling factor for the target location (typically in kpc).
+        x0 (array of floats): Origin of the orbit. Defaults to [0,0,0], the Solar coords.
 
     Returns:
         tuple: A tuple (camera_path, camera_orientations) where:
@@ -788,9 +792,9 @@ def solar_orbit_camera(n_frames, radius, lon0, lat0, dist0):
     t = np.linspace(0, 1, n_frames)
     
     theta = np.linspace(0, 2 * np.pi, n_frames, endpoint=False)
-    x = np.cos(theta) * radius
-    y = np.sin(theta) * radius
-    z = np.zeros_like(x)
+    x = np.cos(theta) * radius + x0[0]
+    y = np.sin(theta) * radius + x0[1]
+    z = np.zeros_like(x) + x0[2]
     camera_path = camera_path_from_txyz(t, x, y, z, closed_loop=True)
 
     l = np.radians(lon0)
@@ -891,7 +895,7 @@ def main():
     # Load the 3D dust map
     print('Loading dust map ...')
     fname = 'data/bayestar_decaps_cube.npz'
-    # Uncomment one of the following as needed:
+    # Uncomment the following two lines to generate the NPZ file:
     # map_values, ln_dist_edges = load_bayestar_decaps(4*512, 4*256)
     # save_dustmap_cube(fname, map_values, ln_dist_edges)
     map_values, ln_dist_edges = load_dustmap_cube(fname)
