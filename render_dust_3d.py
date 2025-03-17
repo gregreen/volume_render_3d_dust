@@ -17,6 +17,80 @@ from scipy.interpolate import CubicSpline
 from tqdm.auto import tqdm
 
 
+def replace_nonfinite(v, fill):
+    """
+    Replaces non-finite values in a numpy ndarray with a specified fill value.
+    """
+    idx = ~np.isfinite(v)
+    v[idx] = fill
+
+
+def load_zhang_green_2025(n_lon, n_lat, return_tensor=True):
+    """
+    Loads the Zhang & Green (2025) 3D dust map, which contains not only dust
+    density, but also R(V). We will load differential versions of both A(V)
+    and R(55), which will be used to render the videos.
+
+    Args:
+        n_lon (int): Number of grid points in longitude.
+        n_lat (int): Number of grid points in latitude.
+        return_tensor (bool, optional): If True, converts the dust map values to a TensorFlow tensor.
+                                        Defaults to True.
+
+    Returns:
+        tuple: A tuple (map_values, ln_dist_edges) where:
+            - map_values (tf.Tensor): Tensor of differential [A(V),R(55)] values (dtype=tf.float32).
+            - ln_dist_edges (np.ndarray): Array of logarithm of distance bin edges.
+    """
+
+    from astropy_healpix import HEALPix, npix_to_nside
+    import h5py
+
+    fname = 'data/zhang_green_2025.h5'
+
+    # Load needed datasets
+    keys = ('E', 'R55')
+    keys_dset = [f'map_64/{k}_map_diff' for k in keys]
+    with h5py.File(fname, 'r') as f:
+        d = {k0: f[k1][:].astype('f4')
+             for k0,k1 in zip(keys,keys_dset)}
+        dist_bin_edges = f['distance_bins'][:].astype('f4')
+    
+    # Replace negative, NaN, inf values in E and R(55)
+    idx = (d['E'] < 0)
+    d['E'][idx] = 0
+    replace_nonfinite(d['E'], 0)
+    replace_nonfinite(d['R55'], np.nanmedian(d['R55']))
+
+    # Convert to (E, E * (1/R55_zp - 1/R55))
+    d['R55'] = d['E'] * (0.36278367 - 1/d['R55'])
+    
+    # Grid of longitudes and latitudes
+    lon = np.linspace(0, 360, n_lon, endpoint=False)
+    lat = np.linspace(-90, 90, n_lat, endpoint=False)
+    lon += 0.5 * (lon[1] - lon[0])
+    lat += 0.5 * (lat[1] - lat[0])
+    lon, lat = np.meshgrid(lon, lat, indexing='ij')
+
+    # Datasets are in nside=256 nested order. Sample on a grid of lon,lat,dist.
+    npix = d[list(d.keys())[0]].shape[1]
+    print(f'npix = {npix}')
+    nside = npix_to_nside(npix)
+    hpix = HEALPix(nside=nside, order='nested')
+    pix_idx = hpix.lonlat_to_healpix(lon*u.deg, lat*u.deg)
+    map_values = np.stack(
+        [d[k][:,pix_idx].transpose(1,2,0) for k in keys],
+        axis=0
+    )
+
+    print('map_values.shape =', map_values.shape)
+
+    if return_tensor:
+        map_values = tf.constant(map_values, dtype=tf.float32)
+
+    return map_values, np.log(dist_bin_edges[1:])
+
+
 def save_dustmap_cube(fname, map_values, ln_dist_edges):
     """
     Saves a 3D dust map in a Cartesian sky projection to an NPZ file. This map
@@ -30,10 +104,8 @@ def save_dustmap_cube(fname, map_values, ln_dist_edges):
     Returns:
         None
     """
-    if isinstance(map_values, tf.Tensor):
-        map_values = map_values.numpy()
-    if isinstance(ln_dist_edges, tf.Tensor):
-        ln_dist_edges = ln_dist_edges.numpy()
+    map_values = np.asarray(map_values)
+    ln_dist_edges = np.asarray(ln_dist_edges)
     np.savez(fname, map_values=map_values, ln_dist_edges=ln_dist_edges)
 
 
@@ -849,6 +921,19 @@ def vertical_bobbing_camera(n_frames, z_max, lon0, lat0, dist0):
     return camera_path, camera_orientations
 
 
+def save_image(img, fname, subtract_min=False):
+    if fname.endswith('png'):
+        # Convert the image array to PNG
+        if subtract_min:
+            img = img - np.nanmin(img)
+        img = (255 * img / np.nanmax(img)).astype('u1')
+        img = Image.fromarray(img.T, mode='L')
+        img.save(fname)
+    elif fname.endswith('npy'):
+        # Save as numpy *.npy format
+        np.save(fname, img)
+
+
 def main():
     """
     Main function to generate a volume-rendered dust map video.
@@ -864,13 +949,14 @@ def main():
     Returns:
         int: Exit status code (0 indicates successful execution).
     """
-    img_shape = (4*256, 4*192)  # (width, height) in pixels
-    fov = 90.          # Field of view in degrees
-    max_ray_dist = 5.  # Maximum ray integration distance, in kpc
-    n_ray_steps = 1000 # Number of distance steps to take along each ray
-    batch_size = 32*32 # How many rays to integrate at once (memory usage)
-    n_frames = 125     # Number of frames in video
+    img_shape = (6*256, 6*192)  # (width, height) in pixels
+    fov = 90.            # Field of view in degrees
+    max_ray_dist = 3.    # Maximum ray integration distance, in kpc
+    n_ray_steps = 1000   # Number of distance steps to take along each ray
+    batch_size = 32*32*4 # How many rays to integrate at once (memory usage)
+    n_frames = 125       # Number of frames in video
     gen_every_n_frames = 1 # If >1, only every nth frame will be generated
+    frame_fname = 'frames/dust_video_v2_{frame:04d}_{channel:d}.npy'
 
     # Generate the camera path and orientations
     print('Generating camera path ...')
@@ -894,11 +980,25 @@ def main():
 
     # Load the 3D dust map
     print('Loading dust map ...')
-    fname = 'data/bayestar_decaps_cube.npz'
-    # Uncomment the following two lines to generate the NPZ file:
-    # map_values, ln_dist_edges = load_bayestar_decaps(4*512, 4*256)
-    # save_dustmap_cube(fname, map_values, ln_dist_edges)
+
+    fname = 'data/zhang_green_2025_cube.npz'
+    map_values, ln_dist_edges = load_zhang_green_2025(4*512, 4*256, return_tensor=False)
+    save_dustmap_cube(fname, map_values, ln_dist_edges)
     map_values, ln_dist_edges = load_dustmap_cube(fname)
+    map_values = [tf.squeeze(v) for v in tf.split(map_values, 2, axis=0)]
+    # print(map_values)
+
+    # fname = 'data/bayestar_decaps_cube.npz'
+    # # # Uncomment the following two lines to generate the NPZ file:
+    # # map_values, ln_dist_edges = load_bayestar_decaps(4*512, 4*256)
+    # # save_dustmap_cube(fname, map_values, ln_dist_edges)
+    # map_values, ln_dist_edges = load_dustmap_cube(fname)
+    # map_values = [map_values]
+    # print(map_values)
+
+    # # Plot map slices
+    # for i,img in enumerate(tf.unstack(map_values, axis=2)):
+    #     save_image(img.numpy(), f'frames/map_slice_{i:03d}.png')
 
     # Render the video frames
     print('Rendering frames ...')
@@ -920,22 +1020,23 @@ def main():
         camera_rays = tf.einsum('ij,...j->...i', R, camera_rays, optimize='optimal')
 
         # Generate the image by integrating each ray
-        col_density = batched_ray_integration(
-            batch_size,
-            map_values,
-            tf.constant(ln_dist_edges[0], dtype=tf.float32),
-            tf.constant(ln_dist_edges[-1], dtype=tf.float32),
-            x0, tf.reshape(camera_rays, (-1, 3)),
-            tf.constant(max_ray_dist, dtype=tf.float32),
-            n_ray_steps
-        )
+        img_list = [
+            batched_ray_integration(
+                batch_size,
+                v,
+                tf.constant(ln_dist_edges[0], dtype=tf.float32),
+                tf.constant(ln_dist_edges[-1], dtype=tf.float32),
+                x0, tf.reshape(camera_rays, (-1, 3)),
+                tf.constant(max_ray_dist, dtype=tf.float32),
+                n_ray_steps
+            )
+            for v in map_values
+        ]
 
-        # Convert the image array to PNG
-        img = col_density.numpy().reshape(img_shape)
-        img = img - np.nanmin(img)
-        img = (255 * img / np.max(img)).astype('u1')
-        img = Image.fromarray(img.T, mode='L')
-        img.save(f'frames/dust_video_{i:04d}.png')
+        # Convert the image arrays to PNG
+        for j,img in enumerate(img_list):
+            img = img.numpy().reshape(img_shape)
+            save_image(img, frame_fname.format(frame=i, channel=j))
     
     return 0
 
