@@ -11,12 +11,25 @@ from PIL import Image
 from render_dust_3d import get_rotation_matrix
 
 
-def render_latex_to_image(latex_str, dpi=300, fontsize=24, pad_inches=0.1):
+def crop_image_transparent(image):
     """
-    Renders a LaTeX string into a PIL Image using matplotlib.
+    Crops an image to the bounding box of non-transparent regions.
+    """
+    # Get the alpha channel and compute its bounding box.
+    alpha = image.split()[-1]
+    bbox = alpha.getbbox()
+    if bbox:
+        return image.crop(bbox)
+    return image
+
+
+def render_text_to_image(s, dpi=300, fontsize=24, pad_inches=0.1,
+                         **kwargs):
+    """
+    Renders a string into a PIL Image using matplotlib.
     
     Parameters:
-      latex_str (str): The LaTeX string to render (without the surrounding $...$).
+      s (str): The string to render.
       dpi (int): Resolution of the rendered image.
       fontsize (int): Font size for the rendered text.
       pad_inches (float): Padding (in inches) around the rendered text.
@@ -31,10 +44,11 @@ def render_latex_to_image(latex_str, dpi=300, fontsize=24, pad_inches=0.1):
     ax.axis('off')
     
     # Render the text. Surround with $...$ to enable math mode.
-    text = ax.text(0.5, 0.5, f'${latex_str}$', fontsize=fontsize,
-                   horizontalalignment='center', verticalalignment='center',
-                   color='k',
-                   transform=ax.transAxes)
+    text = ax.text(0.5, 0.5, s, fontsize=fontsize,
+                   horizontalalignment='center',
+                   verticalalignment='center',
+                   transform=ax.transAxes,
+                   **kwargs)
     
     # Adjust figure size based on text extent.
     fig.canvas.draw()
@@ -48,88 +62,23 @@ def render_latex_to_image(latex_str, dpi=300, fontsize=24, pad_inches=0.1):
     
     # Save the figure to a bytes buffer.
     buf = io.BytesIO()
-    plt.savefig(buf, format='png', dpi=dpi, transparent=True, bbox_inches='tight', pad_inches=pad_inches)
+    plt.savefig(buf, format='png', dpi=dpi, transparent=True,
+                bbox_inches='tight', pad_inches=pad_inches)
     plt.close(fig)
     buf.seek(0)
     
     # Open image with Pillow.
-    return Image.open(buf)
+    img = Image.open(buf)
+
+    # Crop off transparent margins
+    img = crop_image_transparent(img)
+
+    return img
 
 
-def paste_label_on_canvas_old(label_img, center_pixel, target_width, alpha, canvas_size):
-    """
-    Paste a label image onto a blank RGBA canvas using an affine transformation
-    for smooth, continuous scaling and positioning.
-    
-    This approach uses a floating-point scaling factor applied via an affine transform
-    to avoid discrete resizing steps.
-    
-    Parameters:
-      label_img (PIL.Image): The input label image.
-      center_pixel (tuple): (x, y) coordinates for the desired center of the label on the canvas.
-      target_width (float): The desired width of the label in the final canvas.
-      alpha (float): An alpha multiplier (0.0 to 1.0) applied to the label image.
-      canvas_size (tuple): (width, height) for the output canvas.
-    
-    Returns:
-      PIL.Image: The canvas image with the label transformed and composited.
-    """
-    # Ensure the label image is in RGBA mode.
-    label_img = label_img.convert("RGBA")
-    
-    # Get original dimensions.
-    orig_width, orig_height = label_img.size
-    
-    # Compute the scale factor.
-    scale = target_width / orig_width
-
-    # Calculate the transformation matrix.
-    # For an affine transform, Pillow uses a 6-tuple (a, b, c, d, e, f) that maps output pixel
-    # (x, y) to input coordinates (x', y') as:
-    #   x' = a*x + b*y + c,  y' = d*x + e*y + f.
-    #
-    # We want to scale the label by 'scale' and translate it so that the label's center
-    # (orig_width/2, orig_height/2) maps to the specified center_pixel.
-    # This gives:
-    #   c = center_pixel[0] - scale * (orig_width / 2)
-    #   f = center_pixel[1] - scale * (orig_height / 2)
-    a = scale
-    b = 0
-    c = center_pixel[0] - scale * (orig_width / 2)
-    d = 0
-    e = scale
-    f_val = center_pixel[1] - scale * (orig_height / 2)
-    
-    transform_matrix = (a, b, c, d, e, f_val)
-    print(transform_matrix)
-    
-    # Apply the affine transformation.
-    # The output size is the canvas size, so the label will be rendered within the canvas
-    # using the computed transform. The transformation is computed with floating-point precision,
-    # which leads to smooth transitions when 'target_width' changes.
-    transformed_label = label_img.transform(
-        canvas_size, 
-        Image.AFFINE, 
-        transform_matrix, 
-        resample=Image.BILINEAR
-    )
-
-    return transformed_label
-    
-    # Adjust the alpha channel by multiplying it with the given alpha.
-    r, g, b, a_channel = transformed_label.split()
-    a_channel = a_channel.point(lambda p: int(p * alpha))
-    transformed_label.putalpha(a_channel)
-    
-    # Create a blank canvas.
-    canvas = Image.new("RGBA", canvas_size, (0, 0, 0, 0))
-    
-    # Composite the transformed label onto the canvas.
-    canvas = Image.alpha_composite(canvas, transformed_label)
-    return canvas
-
-
-def paste_label_on_canvas(label_img, center_pixel, target_width, alpha, canvas_size):
+def paste_label_on_canvas(label_img, center_pixel, target_width,
+                          alpha, canvas_size,
+                          oversampling=4, background_rgba=(0,0,0,0)):
     """
     Paste a label image onto a blank RGBA canvas using an affine transformation
     for smooth, continuous scaling and positioning.
@@ -143,6 +92,8 @@ def paste_label_on_canvas(label_img, center_pixel, target_width, alpha, canvas_s
       target_width (float): The desired width of the label in the final canvas.
       alpha (float): An alpha multiplier (0.0 to 1.0) applied to the label image.
       canvas_size (tuple): (width, height) for the output canvas.
+      oversampling (int): The oversampling factor for the label image.
+      background_rgba (tuple): The RGBA color of the background.
     
     Returns:
       PIL.Image: The canvas image with the label transformed and composited.
@@ -154,8 +105,13 @@ def paste_label_on_canvas(label_img, center_pixel, target_width, alpha, canvas_s
     orig_width, orig_height = label_img.size
     
     # Compute the forward scale factor.
-    scale = target_width / orig_width
+    scale = oversampling * target_width / orig_width
     inv_scale = 1.0 / scale  # Inverse scale factor for the affine transform.
+
+    # Compute the oversampled canvas dimensions
+    oversampled_canvas_size = tuple([int(x*oversampling) for x in canvas_size])
+    oversampled_width, oversampled_height = oversampled_canvas_size
+    x0, y0 = [x*oversampling for x in center_pixel]
     
     # Compute the inverse transformation matrix.
     # For a canvas coordinate (x, y), the corresponding label image coordinate (u, v) is:
@@ -163,18 +119,18 @@ def paste_label_on_canvas(label_img, center_pixel, target_width, alpha, canvas_s
     #   v = (y - center_pixel[1]) / scale + orig_height/2
     a = inv_scale
     b = 0
-    c = orig_width/2 - center_pixel[0] * inv_scale
+    c = orig_width/2 - x0 * inv_scale
     d = 0
     e = inv_scale
-    f_val = orig_height/2 - (canvas_size[1]-center_pixel[1]) * inv_scale
+    f_val = orig_height/2 - (oversampled_height-y0) * inv_scale
     transform_matrix = (a, b, c, d, e, f_val)
     
     # Apply the affine transformation.
     transformed_label = label_img.transform(
-        canvas_size, 
-        Image.AFFINE, 
-        transform_matrix, 
-        resample=Image.BILINEAR
+        oversampled_canvas_size,
+        Image.AFFINE,
+        transform_matrix,
+        resample=Image.BICUBIC
     )
     
     # Adjust the alpha channel by multiplying it with the given alpha.
@@ -183,10 +139,14 @@ def paste_label_on_canvas(label_img, center_pixel, target_width, alpha, canvas_s
     transformed_label.putalpha(a_channel)
     
     # Create a blank canvas.
-    canvas = Image.new("RGBA", canvas_size, (0, 0, 0, 0))
+    canvas = Image.new('RGBA', oversampled_canvas_size, background_rgba)
     
     # Composite the transformed label onto the canvas.
     canvas = Image.alpha_composite(canvas, transformed_label)
+
+    # Finally, downsample the oversampled canvas to the final canvas size.
+    canvas = canvas.resize(canvas_size, resample=Image.Resampling.LANCZOS)
+
     return canvas
 
 
@@ -222,9 +182,31 @@ def gnomonic_xyz_to_uv(x, y, z, fov):
     return u, v
 
 
-def calc_label_center(xyz, camera_x0, camera_rot, fov, canvas_shape):
+def calc_label_center_and_width(label_xyz,
+                                camera_x0, camera_rot, fov,
+                                canvas_shape,
+                                reference_distance=0.5,
+                                reference_size=0.1):
+    """
+    Calculates the center and width of a label in a 2D image plane, given
+    the camera's position and orientation, the label's position, and the
+    field of view.
+
+    Args:
+      label_xyz (tuple): The (x, y, z) coordinates of the label in the camera's frame.
+      camera_x0 (tuple): The (x, y, z) coordinates of the camera's position.
+      camera_rot (tuple): The (lon, lat, roll) angles of the camera's orientation.
+      fov (float): The field of view of the camera in degrees.
+      canvas_shape (tuple): The (width, height) of the canvas.
+      reference_distance (float): The distance at which the label's width is equal
+                                  to a fraction reference_size of the canvas width.
+      reference_size (float): The width of the label at the reference distance.
+
+    Returns:
+      tuple: The (center, width) of the label in the image plane.
+    """
     # Calculate (x,y,z) of label in camera's native frame
-    dxyz = calc_label_dxyz(xyz, camera_x0, camera_rot)
+    dxyz = calc_label_dxyz(label_xyz, camera_x0, camera_rot)
 
     # Project camera coordinates to image plane
     u, v = gnomonic_xyz_to_uv(*dxyz, fov)
@@ -234,37 +216,55 @@ def calc_label_center(xyz, camera_x0, camera_rot, fov, canvas_shape):
     u = (u+0.5) * w
     v = 0.5*h - v*w
 
-    return u, v
+    # Calculate image size, by setting the width to a given fraction
+    # (reference_size) of the canvas width at a given reference distance
+    # (reference_distance)
+    r = np.linalg.norm(dxyz)
+    label_width = reference_size * w * reference_distance / r
+
+    return (u,v), label_width
 
 
 # Example usage
 def main():
-    label_xyz = (3, 0, 0)
+    label_xyz = (3, 0, 0.5)
     camera_x0 = (0, 0, 0)
     camera_rot = (0, 20, 0)
     fov = 90.
     canvas_shape = (600, 400)
-
-    center = calc_label_center(label_xyz, camera_x0, camera_rot,
-                               fov, canvas_shape)
-    print(center)
+    alpha_val = 0.8 # Label alpha multiplier
 
     # Generate the label image
-    latex_code = r'\odot'
-    label_img = render_latex_to_image(latex_code, fontsize=24)
+    label_text = r'A'
+    label_img = render_text_to_image(
+        label_text,
+        fontsize=24,
+        pad_inches=0,
+        dpi=600,
+        color='k'
+    )
+    label_img.save('frames/label_test_individual.png')
 
-    ## Set the label location parameters
-    #center = (250, 350)         # The pixel where the label's center should appear.
-    target_width = 150.0        # A float value for smooth scaling.
-    alpha_val = 0.8             # Alpha multiplier.
-    #canvas_shape = (600, 400)   # Output canvas dimensions.
-    #
-    result = paste_label_on_canvas(label_img, center, target_width,
-                                   alpha_val, canvas_shape)
+    from tqdm.auto import tqdm
 
-    label_img.show()  # Displays the label image.
-    result.show()  # Displays the canvas with the scaled label image.
-    
+    for i in tqdm(range(11)):
+        label_xyz = (i*0.5+0.1, 0, 0)
+        center,target_width = calc_label_center_and_width(
+            label_xyz, camera_x0,
+            camera_rot, fov,
+            canvas_shape
+        )
+        print(center, target_width)
+
+        result = paste_label_on_canvas(
+            label_img, center,
+            target_width, alpha_val,
+            canvas_shape,
+            background_rgba=(255,255,255,255)
+        )
+
+        result.save(f'frames/label_test_canvas_{i:04d}.png')
+
     return 0
 
 
