@@ -20,7 +20,7 @@ def volrender_data_to_img(arr, cmap='bwr_r',
     # The first channel defines the luminosity of the image
     lum = lum_norm(arr[0])
 
-    if len(arr) == 0:
+    if len(arr) == 1:
         hue = np.full_like(lum, hue_norm(0))
     else:
         # If there is a 2nd channel, use it to set the hue
@@ -45,7 +45,7 @@ def volrender_data_to_img(arr, cmap='bwr_r',
 
 def main():
     n_frames = 125
-    gen_every_n_frames = 1 # If >1, only every nth frame will be generated
+    gen_every_n_frames = 30 # If >1, only every nth frame will be generated
 
     # Backround color
     background_rgba = (0,0,0,255)
