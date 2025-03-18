@@ -5,10 +5,26 @@ import numpy as np
 import matplotlib.pyplot as plt
 #plt.rcParams['text.usetex'] = True
 
-import io
 from PIL import Image
 
-from render_dust_3d import get_rotation_matrix
+import io
+from functools import reduce
+
+from rotations import get_rotation_matrix
+
+
+def alpha_composite_many(images):
+    """
+    Composite a list of RGBA images using alpha_composite.
+    The images are composited in order (first is the background).
+    
+    Parameters:
+        images (list of PIL.Image): List of images with mode 'RGBA' and identical size.
+    
+    Returns:
+        PIL.Image: The composited image.
+    """
+    return reduce(lambda acc, im: Image.alpha_composite(acc, im), images)
 
 
 def crop_image_transparent(image):
@@ -167,15 +183,25 @@ def calc_label_dxyz(xyz, camera_x0, camera_rot):
 
 
 def gnomonic_xyz_to_uv(x, y, z, fov):
-    print(x, y, z)
+    """
+    Convert 3D Cartesian coordinates (x, y, z) to 2D projected coordinates (u, v).
 
+    Args:
+      x, y, z (float): The 3D Cartesian coordinates.
+      fov (float): The field of view of the camera in degrees.
+
+    Returns:
+      tuple: The 2D projected coordinates (u, v).
+    """
+    if z < 0:
+        return np.inf, np.inf
+    
     # Convert (x,y,z) to (theta,phi)
-    phi = np.arctan2(y,x)
-    theta = np.arccos(z/np.sqrt(x**2+y**2+z**2))
+    phi = np.arctan2(y, x)
+    theta = np.arctan2(np.sqrt(x**2+y**2), z)
 
     # Convert (theta,phi) to projected coordinates (u,v)
     r = np.tan(theta) / (2*np.tan(0.5*np.radians(fov)))
-    print(r)
     u = r * np.cos(phi)
     v = r * np.sin(phi)
 
@@ -203,7 +229,7 @@ def calc_label_center_and_width(label_xyz,
       reference_size (float): The width of the label at the reference distance.
 
     Returns:
-      tuple: The (center, width) of the label in the image plane.
+      tuple: The (center, width, distance) of the label in the image plane.
     """
     # Calculate (x,y,z) of label in camera's native frame
     dxyz = calc_label_dxyz(label_xyz, camera_x0, camera_rot)
@@ -219,15 +245,15 @@ def calc_label_center_and_width(label_xyz,
     # Calculate image size, by setting the width to a given fraction
     # (reference_size) of the canvas width at a given reference distance
     # (reference_distance)
-    r = np.linalg.norm(dxyz)
+    r = np.linalg.norm(dxyz) * np.sign(dxyz[2]) # Signed distance (behind camera)
     label_width = reference_size * w * reference_distance / r
 
-    return (u,v), label_width
+    return (u,v), label_width, r
 
 
 # Example usage
 def main():
-    label_xyz = (3, 0, 0.5)
+    label_xyz = (1.0, 0, 0.2)
     camera_x0 = (0, 0, 0)
     camera_rot = (0, 20, 0)
     fov = 90.
@@ -235,11 +261,11 @@ def main():
     alpha_val = 0.8 # Label alpha multiplier
 
     # Generate the label image
-    label_text = r'A'
+    label_text = r'Orion A'
     label_img = render_text_to_image(
         label_text,
         fontsize=24,
-        pad_inches=0,
+        pad_inches=0.1,
         dpi=600,
         color='k'
     )
@@ -248,8 +274,8 @@ def main():
     from tqdm.auto import tqdm
 
     for i in tqdm(range(11)):
-        label_xyz = (i*0.5+0.1, 0, 0)
-        center,target_width = calc_label_center_and_width(
+        label_xyz = (0.5*(i-5), 0, 0.0)
+        center,target_width,r = calc_label_center_and_width(
             label_xyz, camera_x0,
             camera_rot, fov,
             canvas_shape

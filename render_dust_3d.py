@@ -2,7 +2,6 @@ import numpy as np
 
 import tensorflow as tf
 from tensorflow_graphics.math.interpolation.trilinear import interpolate as trilinear_interpolate
-from tensorflow_graphics.geometry.transformation import rotation_matrix_3d, quaternion
 
 from PIL import Image
 import matplotlib.pyplot as plt
@@ -15,6 +14,9 @@ import astropy.units as u
 from scipy.interpolate import CubicSpline
 
 from tqdm.auto import tqdm
+
+from rotations import get_rotation_matrix
+from render_labels import render_text_to_image, paste_label_on_canvas, calc_label_center_and_width, alpha_composite_many
 
 
 def replace_nonfinite(v, fill):
@@ -315,7 +317,9 @@ def spherical_to_ijk(r, theta, phi, proj_shape,
 def integrate_dust_along_rays(map_values,
                               ln_dist_min, ln_dist_max,
                               x0, ray_dir,
-                              max_ray_dist, n_steps):
+                              min_ray_dist,
+                              max_ray_dist,
+                              n_steps):
     """
     Integrates dust density along rays through the dust map.
 
@@ -325,6 +329,7 @@ def integrate_dust_along_rays(map_values,
         ln_dist_max (float or tf.Tensor): Maximum logarithm of distance.
         x0 (tf.Tensor): Tensor of shape (3,) representing the ray origin in Cartesian coordinates.
         ray_dir (tf.Tensor): Tensor of shape (num_pixels, 3) representing normalized ray direction vectors.
+        min_ray_dist (float or tf.Tensor): Minimum distance to integrate along each ray.
         max_ray_dist (float or tf.Tensor): Maximum distance to integrate along each ray.
         n_steps (int): Number of sampling steps along each ray.
 
@@ -332,7 +337,7 @@ def integrate_dust_along_rays(map_values,
         tf.Tensor: A 1D tensor of integrated dust column densities for each ray.
     """
     print('Tracing integrate_dust_along_rays...')
-    t_vals = tf.cast(tf.linspace(0., max_ray_dist, n_steps),
+    t_vals = tf.cast(tf.linspace(min_ray_dist, max_ray_dist, n_steps),
                      dtype=ray_dir.dtype)
     sample_xyz = tf.expand_dims(ray_dir, 1) * tf.reshape(t_vals, (1, -1, 1))
     sample_xyz = tf.reshape(sample_xyz, (-1, 3))
@@ -358,55 +363,70 @@ def integrate_dust_along_rays(map_values,
     return tf.reduce_sum(sample_values, axis=-1) * (max_ray_dist / n_steps)
 
 
-def interpolate_rotation_matrices(R0, R1, t):
+@tf.function
+def integrate_dust_along_rays_binned(map_values,
+                                     ln_dist_min, ln_dist_max,
+                                     x0, ray_dir,
+                                     min_ray_dist,
+                                     max_ray_dist,
+                                     n_steps,
+                                     dist_bin_edges):
     """
-    Interpolates between two 3D rotation matrices using SLERP (spherical linear interpolation) via quaternions.
-
+    Integrates dust density along rays in specified distance bins using cumulative integration.
+    
     Args:
-        R0 (tf.Tensor): A 3x3 rotation matrix representing the initial orientation.
-        R1 (tf.Tensor): A 3x3 rotation matrix representing the final orientation.
-        t (float or tf.Tensor): Interpolation factor in the range [0, 1].
-
+        map_values (tf.Tensor): 3D tensor of dust map densities with shape (lon, lat, dist).
+        ln_dist_min, ln_dist_max: Minimum/maximum logarithm of distance.
+        x0 (tf.Tensor): Ray origin (shape (3,)).
+        ray_dir (tf.Tensor): Normalized ray directions (shape (num_pixels, 3)).
+        min_ray_dist, max_ray_dist: Integration bounds along the ray.
+        n_steps (int): Number of samples along each ray.
+        dist_bin_edges (tf.Tensor): 1D tensor of distance bin boundaries (shape (num_bins+1,)).
+    
     Returns:
-        tf.Tensor: A 3x3 rotation matrix representing the interpolated rotation.
+        tf.Tensor: Tensor of shape (num_bins, num_pixels) with the integrated dust density per bin.
     """
-    q0 = quaternion.from_rotation_matrix(R0)
-    q1 = quaternion.from_rotation_matrix(R1)
-    dot = tf.reduce_sum(q0 * q1)
-    q1 = q1 * tf.sign(dot)
-    dot = tf.reduce_sum(q0 * q1)
-    theta = tf.acos(tf.clip_by_value(dot, -1.0, 1.0))
-    sin_theta = tf.sin(theta)
-    q = (tf.sin((1 - t) * theta) / sin_theta) * q0 + (tf.sin(t * theta) / sin_theta) * q1
-    return rotation_matrix_3d.from_quaternion(q)
-
-
-def get_rotation_matrix(lon, lat, roll):
-    """
-    Computes a rotation matrix based on given Euler angles (longitude, latitude, and roll).
-
-    Args:
-        lon (float): Longitude angle in degrees.
-        lat (float): Latitude angle in degrees.
-        roll (float): Roll angle in degrees.
-
-    Returns:
-        tf.Tensor: A 3x3 rotation matrix computed from the input angles.
-    """
-    R2 = rotation_matrix_3d.from_axis_angle(
-        tf.cast([0., 0., 1.], tf.float32),
-        tf.cast([np.radians(lon - 90)], tf.float32)
+    # Create sample positions along each ray.
+    t_vals = tf.cast(tf.linspace(min_ray_dist, max_ray_dist, n_steps), dtype=ray_dir.dtype)
+    dt = (max_ray_dist - min_ray_dist) / tf.cast(n_steps - 1, ray_dir.dtype)
+    
+    # Compute sample positions (shape: (num_pixels, n_steps, 3)).
+    sample_xyz = tf.expand_dims(ray_dir, 1) * tf.reshape(t_vals, (1, -1, 1))
+    sample_xyz = tf.reshape(sample_xyz, (-1, 3)) + tf.expand_dims(x0, axis=0)
+    
+    # Convert Cartesian to spherical coordinates.
+    r, theta, phi = xyz_to_spherical(sample_xyz)
+    
+    # Map spherical coordinates to index space.
+    proj_shape, n_dists = tf.split(tf.shape(map_values), [2, 1], axis=0)
+    sample_ijk = spherical_to_ijk(
+        r, theta, phi,
+        proj_shape,
+        ln_dist_min, ln_dist_max, n_dists
     )
-    R1 = rotation_matrix_3d.from_axis_angle(
-        tf.cast([1., 0., 0.], tf.float32),
-        tf.cast([np.radians(lat - 90)], tf.float32)
-    )
-    R0 = rotation_matrix_3d.from_axis_angle(
-        tf.cast([0., 0., 1.], tf.float32),
-        tf.cast([-np.radians(roll)], tf.float32)
-    )
-    R = tf.einsum('ij,jk,kl->il', R2, R1, R0)
-    return R
+    
+    # Interpolate values from the dust map.
+    sample_values = trilinear_interpolate(tf.expand_dims(map_values, -1), sample_ijk)
+    sample_values = tf.reshape(sample_values, (-1, n_steps))
+    sample_values = tf.where(tf.math.is_nan(sample_values), tf.zeros_like(sample_values), sample_values)
+    
+    # Compute the cumulative integral along each ray.
+    cumsum = tf.cumsum(sample_values, axis=-1) * dt  # shape: (num_pixels, n_steps)
+    
+    # Find indices corresponding to bin boundaries.
+    # t_vals is shape (n_steps,), dist_bin_edges is shape (num_bins+1,).
+    indices = tf.searchsorted(t_vals, dist_bin_edges)
+    indices = tf.clip_by_value(indices, 0, n_steps - 1)
+    
+    # Gather cumulative values at the bin boundaries.
+    lower_vals = tf.gather(cumsum, indices[:-1], axis=1)
+    upper_vals = tf.gather(cumsum, indices[1:], axis=1)
+    
+    # The difference yields the integrated value in each bin.
+    bin_integrals = upper_vals - lower_vals  # shape: (num_pixels, num_bins)
+    
+    # Transpose so that shape is (num_bins, num_pixels)
+    return bin_integrals#tf.transpose(bin_integrals)
 
 
 def location_by_name(name, dist):
@@ -784,7 +804,10 @@ def batch_apply_tf(f, batch_size, *args,
 def batched_ray_integration(batch_size, map_values,
                             ln_dist_min, ln_dist_max,
                             x0, ray_dir,
-                            max_ray_dist, n_steps):
+                            min_ray_dist,
+                            max_ray_dist,
+                            n_steps,
+                            dist_bin_edges=None):
     """
     Performs batched integration of dust density along rays.
 
@@ -795,19 +818,31 @@ def batched_ray_integration(batch_size, map_values,
         ln_dist_max (tf.Tensor or float): Maximum logarithm of distance.
         x0 (tf.Tensor): Tensor of shape (3,) representing the camera position.
         ray_dir (tf.Tensor): Tensor of shape (num_rays, 3) representing ray direction vectors.
+        min_ray_dist (tf.Tensor or float): Minimum integration distance along each ray.
         max_ray_dist (tf.Tensor or float): Maximum integration distance along each ray.
         n_steps (int): Number of integration steps along each ray.
+        dist_bin_edges (tf.Tensor, optional): Distance bin edges for the integrated values.
 
     Returns:
         tf.Tensor: A 1D tensor of integrated dust column densities for each ray.
     """
-    def f_int_batch(ray_dir_batch):
-        return integrate_dust_along_rays(
-            map_values,
-            ln_dist_min, ln_dist_max,
-            x0, ray_dir_batch,
-            max_ray_dist, n_steps
-        )
+    if dist_bin_edges is None:
+        def f_int_batch(ray_dir_batch):
+            return integrate_dust_along_rays(
+                map_values,
+                ln_dist_min, ln_dist_max,
+                x0, ray_dir_batch,
+                min_ray_dist, max_ray_dist, n_steps
+            )
+    else:
+        def f_int_batch(ray_dir_batch):
+            return integrate_dust_along_rays_binned(
+                map_values,
+                ln_dist_min, ln_dist_max,
+                x0, ray_dir_batch,
+                min_ray_dist, max_ray_dist, n_steps,
+                dist_bin_edges
+            )
     return batch_apply_tf(f_int_batch, batch_size, ray_dir)
 
 
@@ -934,6 +969,37 @@ def save_image(img, fname, subtract_min=False):
         np.save(fname, img)
 
 
+def create_labels(dpi=600, scaling=0.8):
+    # Define the labels to be rendered
+    labels = [
+        {'xyz':[0, 0, 0], 'text':r'$\odot$'},
+        {'xyz':[8.3, 0, 0], 'text':r'Galactic Center'},
+        {'xyz':location_by_name('Orion A', 0.4), 'text':'Ori A'},
+        {'xyz':location_by_name('rho Ophiuchus', 0.2), 'text':r'$\rho$ Oph'}
+    ]
+
+    # Render the labels
+    for l in labels:
+        img = render_text_to_image(l['text'], dpi=dpi, color='g')
+        l['img'] = img
+        l['scale'] = scaling * img.size[0] / dpi
+
+    return labels
+
+
+def save_image_stack_to_npy(images, fname):
+    """
+    Stacks a list of Image objects along a new first axis
+    and saves the resulting array to a .npy file.
+
+    Args:
+        images (list of PIL.Image.Image): List of Pillow images.
+        filename (str): Path to the output .npy file.
+    """
+    stacked_array = np.stack([np.array(img) for img in images], axis=0)
+    np.save(fname, stacked_array)
+
+
 def main():
     """
     Main function to generate a volume-rendered dust map video.
@@ -942,34 +1008,39 @@ def main():
         1. Defines image and camera parameters.
         2. Generates a camera path and orientations using the vertical bobbing model.
         3. Plots and saves the camera path.
-        4. Loads a dust map from a file.
-        5. Renders frames by integrating dust along camera rays.
-        6. Saves each frame as a PNG image.
+        4. Loads labels that will be embedded at specific locations.
+        5. Loads a dust map from a file.
+        6. Renders labels on each frame.
+        7. Renders frames by integrating dust along camera rays.
+        8. Saves the data necessary to composite each frame into a .npz file.
 
     Returns:
         int: Exit status code (0 indicates successful execution).
     """
-    img_shape = (6*256, 6*192)  # (width, height) in pixels
+    img_shape = (2*256, 2*192)  # (width, height) in pixels
     fov = 90.            # Field of view in degrees
     max_ray_dist = 3.    # Maximum ray integration distance, in kpc
-    n_ray_steps = 1000   # Number of distance steps to take along each ray
+    n_ray_steps = 100    # Number of distance steps to take along each ray
     batch_size = 32*32*4 # How many rays to integrate at once (memory usage)
     n_frames = 125       # Number of frames in video
     gen_every_n_frames = 1 # If >1, only every nth frame will be generated
-    frame_fname = 'frames/dust_video_v2_{frame:04d}_{channel:d}.npy'
+    label_scaling = 0.5  # Overall scaling to apply to label sizes
+    frame_fname = 'frames/frame_data_{frame:04d}.npz'
 
     # Generate the camera path and orientations
     print('Generating camera path ...')
-    lon0, lat0, dist0 = 0., 0., 1.
-    camera_path, camera_orientations = vertical_bobbing_camera(
-        n_frames, 0.5,
-        lon0, lat0, dist0
-    )
-    # Alternatively, use solar_orbit_camera:
-    # camera_path, camera_orientations = solar_orbit_camera(
-    #    n_frames, 0.025,
-    #    lon0, lat0, dist0
+    stare_coords = SkyCoord.from_name('lambda Orionis').galactic
+    lon0, lat0, dist0 = stare_coords.l.deg, stare_coords.b.deg, 1.0
+    # lon0, lat0, dist0 = 0., 0., 1.
+    # camera_path, camera_orientations = vertical_bobbing_camera(
+    #     n_frames, 0.5,
+    #     lon0, lat0, dist0
     # )
+    # Alternatively, use solar_orbit_camera:
+    camera_path, camera_orientations = solar_orbit_camera(
+       n_frames, 0.025,
+       lon0, lat0, dist0
+    )
     # Alternatively, use the flythrough_camera:
     # camera_path, camera_orientations = flythrough_camera(n_frames)
 
@@ -978,11 +1049,16 @@ def main():
     fig.savefig('frames/camera_path.svg')
     plt.close(fig)
 
+    # Generate the labels
+    print('Generating labels ...')
+    labels = create_labels(dpi=img_shape[0]*600/512, scaling=label_scaling)
+
     # Load the 3D dust map
     print('Loading dust map ...')
 
     fname = 'data/zhang_green_2025_cube.npz'
-    map_values, ln_dist_edges = load_zhang_green_2025(4*512, 4*256, return_tensor=False)
+    map_values, ln_dist_edges = load_zhang_green_2025(4*512, 4*256,
+                                                      return_tensor=False)
     save_dustmap_cube(fname, map_values, ln_dist_edges)
     map_values, ln_dist_edges = load_dustmap_cube(fname)
     map_values = [tf.squeeze(v) for v in tf.split(map_values, 2, axis=0)]
@@ -1011,13 +1087,62 @@ def main():
         t = camera_orientations['t'][i]
         x0 = [spl(t) for spl in camera_path['x_splines']]
         x0 = tf.constant(x0, dtype=tf.float32)
-        R = get_rotation_matrix(
+        camera_rot = (
             camera_orientations['lon'][i],
             camera_orientations['lat'][i],
             camera_orientations['roll'][i]
         )
+
+        # Project the labels onto the camera, and determine
+        # the distance to each label
+        label_proj = []
+        label_distance = []
+        for l in labels:
+            center,target_width,r = calc_label_center_and_width(
+                l['xyz'], x0.numpy(),
+                camera_rot, fov,
+                img_shape
+            )
+            if r <= 0: # Don't render labels behind camera
+                continue
+            img = paste_label_on_canvas(
+                l['img'], center,
+                target_width*l['scale'],
+                1.0, # label alpha
+                img_shape,
+                background_rgba=(0,0,0,0)
+            )
+            label_proj.append(img)
+            label_distance.append(r)
+        
+        # Sort the label images by distance
+        idx_sort = np.argsort(label_distance)
+        label_proj = [label_proj[i] for i in idx_sort]
+        label_distance = np.sort(label_distance)
+        stacked_labels = np.stack([
+            np.array(img) for img in label_proj
+        ], axis=0)
+
+        # # Save the composited label images
+        # img = alpha_composite_many(label_proj)
+        # img.save(f'frames/labels_{i:04d}.png')
+
+        # Determine the distance ranges in which to volume render.
+        # There should be a break at the distance to each label,
+        # so that the labels can be embedded into the volume rendering.
+        int_dist_edges = np.hstack([0, label_distance])
+        idx = np.sum(int_dist_edges < max_ray_dist)
+        int_dist_edges = int_dist_edges[:idx]
+        int_dist_edges = np.hstack([int_dist_edges, max_ray_dist])
+
+        # Generate the camera-ray unit vectors
+        R = get_rotation_matrix(*camera_rot)
         camera_rays = gnomonic_projection(fov, img_shape)
-        camera_rays = tf.einsum('ij,...j->...i', R, camera_rays, optimize='optimal')
+        camera_rays = tf.einsum(
+            'ij,...j->...i',
+            R, camera_rays,
+            optimize='optimal'
+        )
 
         # Generate the image by integrating each ray
         img_list = [
@@ -1027,20 +1152,36 @@ def main():
                 tf.constant(ln_dist_edges[0], dtype=tf.float32),
                 tf.constant(ln_dist_edges[-1], dtype=tf.float32),
                 x0, tf.reshape(camera_rays, (-1, 3)),
+                tf.constant(0., dtype=tf.float32),
                 tf.constant(max_ray_dist, dtype=tf.float32),
-                n_ray_steps
+                n_ray_steps,
+                dist_bin_edges=tf.constant(int_dist_edges, dtype=tf.float32)
             )
             for v in map_values
         ]
 
-        # Convert the image arrays to PNG
-        for j,img in enumerate(img_list):
-            img = img.numpy().reshape(img_shape)
-            save_image(img, frame_fname.format(frame=i, channel=j))
+        # Stack the volume-rendered images into a single array
+        volrender_data = []
+        for img in img_list:
+            img = img.numpy()
+            img.shape = img_shape + (-1,)
+            # Rotate last axis to first position
+            img = np.moveaxis(img, -1, 0)
+            volrender_data.append(img)
+        volrender_data = np.stack(volrender_data, axis=1)
+
+        # Store all the frame data in a single .npz file
+        frame_data = dict(
+            labels=stacked_labels,   # shape = (n_labels, w, h)
+            volrender=volrender_data # shape = (n_dist_bins, n_channels, w, h)
+        )
+        np.savez(
+            frame_fname.format(frame=i),
+            **frame_data
+        )
     
     return 0
 
-# ffmpeg -y -r 25 -i frames/dust_video_%04d.png -c:v libx264 -crf 25 -pix_fmt yuv420p -profile:v baseline -movflags +faststart -r 25 videos/dust_video.mp4
 
 if __name__ == '__main__':
     main()
