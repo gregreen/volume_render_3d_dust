@@ -44,8 +44,8 @@ def volrender_data_to_img(arr, cmap='bwr_r',
 
 
 def main():
-    n_frames = 125
-    gen_every_n_frames = 30 # If >1, only every nth frame will be generated
+    n_frames = 400
+    gen_every_n_frames = 1 # If >1, only every nth frame will be generated
 
     # Backround color
     background_rgba = (0,0,0,255)

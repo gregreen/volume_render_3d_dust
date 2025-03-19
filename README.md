@@ -9,13 +9,16 @@ volume-render 3D dust maps. The key elements that go into the rendering are:
   1. A 3D dust map, reprojected to a Cartesian sky projection.
   2. A set of camera positions and orientations (one per frame).
   3. Camera properties (field of view, resolution, etc.).
+  4. Label properties (3D positions, text).
 
 The `main()` function of `render_dust_3d.py` contains an example of how to
-generate the frames of a volume-rendered video. The helper functions can be
-used to generate different camera paths or to load different 3D dust maps.
+generate the frame dat for a volume-rendered video. The helper functions can
+be used to generate different camera paths or to load different 3D dust maps.
+After the frame data has been generated, this data can be converted into PNG
+images using `npz_stack_to_frames.py`.
 
-After the frames have been generated, `ffmpeg` can be used to turn them into
-a video. Two scripts are provided to do this:
+The frames can then be turned into a video using `ffmpeg`. Two scripts are
+provided to do this:
 
   1. `gen_ping_pong_video.sh`: Generates a video by first running through the
      frames in the forward direction, and then running through them in the

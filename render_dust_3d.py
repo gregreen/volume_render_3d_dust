@@ -27,6 +27,35 @@ def replace_nonfinite(v, fill):
     v[idx] = fill
 
 
+def combine_zg25_bayestar(map_values_zg25, ln_dist_edges_zg25,
+                          map_values_bayestar, ln_dist_edges_bayestar):
+    """
+    Combines the dust density from Bayestar with the R(V) channel
+    from Zhang & Green (2025).
+    """
+
+    # Extract (1/R0 - 1/R) from ZG25 map
+    color_zg25 = map_values_zg25[1] / (map_values_zg25[0] + 1e-5)
+
+    # Determine distance grid on which to resample ZG25
+    idx_pull = np.searchsorted(ln_dist_edges_zg25, ln_dist_edges_bayestar) - 1
+    idx_valid = (idx_pull >= 0) & (idx_pull < len(ln_dist_edges_zg25))
+    idx_pull[~idx_valid] = 0
+
+    # Pull values from ZG25
+    color_zg25_resamp = color_zg25.numpy()[:,:,idx_pull]
+    color_zg25_resamp[:,:,~idx_valid] = 0
+
+    # Multiply by Bayestar extinction density
+    color_zg25_resamp *= map_values_bayestar[0].numpy()
+    print(color_zg25_resamp)
+
+    # Convert to Tensor
+    color_zg25_resamp = tf.constant(color_zg25_resamp, dtype=tf.float32)
+
+    return [map_values_bayestar[0],color_zg25_resamp], ln_dist_edges_bayestar
+
+
 def load_zhang_green_2025(n_lon, n_lat, return_tensor=True):
     """
     Loads the Zhang & Green (2025) 3D dust map, which contains not only dust
@@ -74,7 +103,7 @@ def load_zhang_green_2025(n_lon, n_lat, return_tensor=True):
     lat += 0.5 * (lat[1] - lat[0])
     lon, lat = np.meshgrid(lon, lat, indexing='ij')
 
-    # Datasets are in nside=256 nested order. Sample on a grid of lon,lat,dist.
+    # Datasets are in nested order. Sample on a grid of lon,lat,dist.
     npix = d[list(d.keys())[0]].shape[1]
     print(f'npix = {npix}')
     nside = npix_to_nside(npix)
@@ -429,19 +458,27 @@ def integrate_dust_along_rays_binned(map_values,
     return bin_integrals#tf.transpose(bin_integrals)
 
 
-def location_by_name(name, dist):
+def location_by_name(name, dist, offset_by=None):
     """
-    Computes the Cartesian coordinates of a celestial object by its name at a specified distance.
+    Computes the Cartesian coordinates of a celestial object by its name at a
+    specified distance.
 
     Args:
         name (str): Name of the celestial object (e.g., 'Orion A').
-        dist (float): Distance scaling factor (e.g., in kpc) to apply to the coordinates.
+        dist (float): Distance (in kpc) to the object.
+        offset_by (tuple, optional): Offset the Galactic sky coordinates
+                                     by (position angle, distance).
 
     Returns:
-        np.ndarray: A 1D array of shape (3,) containing the (x, y, z) Cartesian coordinates scaled by dist.
+        np.ndarray: A 1D array of shape (3,) containing the (x, y, z)
+                    Cartesian coordinates scaled by dist.
     """
-    c = SkyCoord.from_name(name)
-    return c.galactic.cartesian.xyz.value * dist
+    c = SkyCoord.from_name(name).galactic
+    # Add offset to the Galactic coordinates
+    if offset_by is not None:
+        c = c.directional_offset_by(offset_by[0]*u.deg, offset_by[1]*u.deg)
+    # Convert to cartesian coordinates and scale by the distance
+    return c.cartesian.xyz.value * dist
 
 
 def camera_path_from_key_locations(key_locations, closed_loop=False):
@@ -974,8 +1011,20 @@ def create_labels(dpi=600, scaling=0.8):
     labels = [
         {'xyz':[0, 0, 0], 'text':r'$\odot$'},
         {'xyz':[8.3, 0, 0], 'text':r'Galactic Center'},
-        {'xyz':location_by_name('Orion A', 0.4), 'text':'Ori A'},
-        {'xyz':location_by_name('rho Ophiuchus', 0.2), 'text':r'$\rho$ Oph'}
+        {'xyz':location_by_name('Orion A',0.4,offset_by=(180,2.7)),
+         'text':'Ori A'},
+        {'xyz':location_by_name('Mon R2',0.8,offset_by=(-90,3)),
+         'text':r'Mon R2'},
+        {'xyz':location_by_name('lambda Orionis',0.4),
+         'text':r'$\lambda$ Ori'},
+        {'xyz':location_by_name('IC 348',0.25,offset_by=(-90,6)),
+         'text':r'Perseus'},
+        {'xyz':location_by_name('Taurus',0.22,offset_by=(90,7)),
+         'text':r'Taurus'},
+        {'xyz':location_by_name('rho Ophiuchus',0.25,offset_by=(-90,8)),
+         'text':r'$\rho$ Oph'},
+        {'xyz':location_by_name('Pipe nebula',0.25,offset_by=(-90,8)),
+         'text':r'Pipe'},
     ]
 
     # Render the labels
@@ -1017,32 +1066,32 @@ def main():
     Returns:
         int: Exit status code (0 indicates successful execution).
     """
-    img_shape = (2*256, 2*192)  # (width, height) in pixels
+    img_shape = (4*256, 4*192)  # (width, height) in pixels
     fov = 90.            # Field of view in degrees
     max_ray_dist = 3.    # Maximum ray integration distance, in kpc
-    n_ray_steps = 100    # Number of distance steps to take along each ray
+    n_ray_steps = 300    # Number of distance steps to take along each ray
     batch_size = 32*32*4 # How many rays to integrate at once (memory usage)
-    n_frames = 125       # Number of frames in video
+    n_frames = 400       # Number of frames in video
     gen_every_n_frames = 1 # If >1, only every nth frame will be generated
     label_scaling = 0.5  # Overall scaling to apply to label sizes
     frame_fname = 'frames/frame_data_{frame:04d}.npz'
 
     # Generate the camera path and orientations
     print('Generating camera path ...')
-    stare_coords = SkyCoord.from_name('lambda Orionis').galactic
-    lon0, lat0, dist0 = stare_coords.l.deg, stare_coords.b.deg, 1.0
+    # stare_coords = SkyCoord.from_name('lambda Orionis').galactic
+    # lon0, lat0, dist0 = stare_coords.l.deg, stare_coords.b.deg, 1.0
     # lon0, lat0, dist0 = 0., 0., 1.
     # camera_path, camera_orientations = vertical_bobbing_camera(
     #     n_frames, 0.5,
     #     lon0, lat0, dist0
     # )
     # Alternatively, use solar_orbit_camera:
-    camera_path, camera_orientations = solar_orbit_camera(
-       n_frames, 0.025,
-       lon0, lat0, dist0
-    )
+    # camera_path, camera_orientations = solar_orbit_camera(
+    #    n_frames, 0.025,
+    #    lon0, lat0, dist0
+    # )
     # Alternatively, use the flythrough_camera:
-    # camera_path, camera_orientations = flythrough_camera(n_frames)
+    camera_path, camera_orientations = flythrough_camera(n_frames)
 
     # Plot the camera path
     fig = plot_camera_path(camera_path)
@@ -1056,21 +1105,35 @@ def main():
     # Load the 3D dust map
     print('Loading dust map ...')
 
-    fname = 'data/zhang_green_2025_cube.npz'
-    map_values, ln_dist_edges = load_zhang_green_2025(4*512, 4*256,
-                                                      return_tensor=False)
-    save_dustmap_cube(fname, map_values, ln_dist_edges)
-    map_values, ln_dist_edges = load_dustmap_cube(fname)
-    map_values = [tf.squeeze(v) for v in tf.split(map_values, 2, axis=0)]
-    # print(map_values)
-
-    # fname = 'data/bayestar_decaps_cube.npz'
-    # # # Uncomment the following two lines to generate the NPZ file:
-    # # map_values, ln_dist_edges = load_bayestar_decaps(4*512, 4*256)
+    # fname = 'data/zhang_green_2025_cube.npz'
+    # # map_values, ln_dist_edges = load_zhang_green_2025(4*512, 4*256,
+    # #                                                   return_tensor=False)
     # # save_dustmap_cube(fname, map_values, ln_dist_edges)
     # map_values, ln_dist_edges = load_dustmap_cube(fname)
-    # map_values = [map_values]
+    # map_values = [tf.squeeze(v) for v in tf.split(map_values, 2, axis=0)]
+    # print(ln_dist_edges)
+    # print(map_values[0].shape)
     # print(map_values)
+
+    fname = 'data/bayestar_decaps_cube.npz'
+    # # Uncomment the following two lines to generate the NPZ file:
+    # map_values, ln_dist_edges = load_bayestar_decaps(4*512, 4*256)
+    # save_dustmap_cube(fname, map_values, ln_dist_edges)
+    map_values, ln_dist_edges = load_dustmap_cube(fname)
+    map_values = [map_values]
+    # print(map_values)
+    # print(ln_dist_edges)
+
+    # fname = 'data/zhang_green_2025_cube.npz'
+    # map_values, ln_dist_edges_zg25 = load_dustmap_cube(fname)
+    # map_values_zg25 = [tf.squeeze(v) for v in tf.split(map_values, 2, axis=0)]
+    # fname = 'data/bayestar_decaps_cube.npz'
+    # map_values_bd, ln_dist_edges_bd = load_dustmap_cube(fname)
+    # map_values_bd = [map_values_bd]
+    # map_values, ln_dist_edges = combine_zg25_bayestar(
+    #     map_values_zg25, ln_dist_edges_zg25,
+    #     map_values_bd, ln_dist_edges_bd
+    # )
 
     # # Plot map slices
     # for i,img in enumerate(tf.unstack(map_values, axis=2)):
@@ -1119,9 +1182,12 @@ def main():
         idx_sort = np.argsort(label_distance)
         label_proj = [label_proj[i] for i in idx_sort]
         label_distance = np.sort(label_distance)
-        stacked_labels = np.stack([
-            np.array(img) for img in label_proj
-        ], axis=0)
+        if len(label_proj) == 0:
+            stacked_labels = np.array([])
+        else:
+            stacked_labels = np.stack([
+                np.array(img) for img in label_proj
+            ], axis=0)
 
         # # Save the composited label images
         # img = alpha_composite_many(label_proj)
